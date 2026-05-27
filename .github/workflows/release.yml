@@ -29,7 +29,7 @@ jobs:
       run: go build -o nvml_exporter
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: nvml_exporter-v0.2.3-${{ steps.get_arch.outputs.arch }}
         path: nvml_exporter
