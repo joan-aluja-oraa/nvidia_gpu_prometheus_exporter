@@ -55,14 +55,15 @@ var (
 	}
 
 	clockTypes = map[nvml.ClockType]string{nvml.CLOCK_GRAPHICS: "graphics", nvml.CLOCK_SM: "sm", nvml.CLOCK_MEM: "mem", nvml.CLOCK_VIDEO: "video"}
-
-	gpmState    = make(map[string]int)
-	gpmSamples1 = make(map[string]nvml.GpmSample)
-	gpmSamples2 = make(map[string]nvml.GpmSample)
 )
 
 type Collector struct {
 	sync.Mutex
+	// GPM state is per-collector and protected by the collector mutex.
+	gpmState    map[string]int
+	gpmSamples1 map[string]nvml.GpmSample
+	gpmSamples2 map[string]nvml.GpmSample
+
 	numDevices          prometheus.Gauge
 	usedMemory          *prometheus.GaugeVec
 	totalMemory         *prometheus.GaugeVec
@@ -101,6 +102,9 @@ type Device struct {
 
 func NewCollector() *Collector {
 	return &Collector{
+		gpmState:    make(map[string]int),
+		gpmSamples1: make(map[string]nvml.GpmSample),
+		gpmSamples2: make(map[string]nvml.GpmSample),
 		numDevices: prometheus.NewGauge(
 			prometheus.GaugeOpts{
 				Namespace: namespace,
@@ -324,15 +328,16 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	c.lastError.Describe(ch)
 }
 
-func allocGpmSamples(uuid string) error {
+// allocGpmSamples must be called with c.Lock held.
+func (c *Collector) allocGpmSamples(uuid string) nvml.Return {
 	err := nvml.SUCCESS
-	if _, exists := gpmSamples1[uuid]; !exists {
-		gpmSamples1[uuid], err = nvml.GpmSampleAlloc()
+	if _, exists := c.gpmSamples1[uuid]; !exists {
+		c.gpmSamples1[uuid], err = nvml.GpmSampleAlloc()
 		if err != nvml.SUCCESS {
 			log.Printf("GPU(%s) failed to allocate GpmSample1 with error: %v", uuid, err)
 			return err
 		}
-		gpmSamples2[uuid], err = nvml.GpmSampleAlloc()
+		c.gpmSamples2[uuid], err = nvml.GpmSampleAlloc()
 		if err != nvml.SUCCESS {
 			log.Printf("GPU(%s) failed to allocate GpmSample2 with error: %v", uuid, err)
 			return err
@@ -346,6 +351,10 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	c.Lock()
 	defer c.Unlock()
 
+	// Reset every metric vector each scrape. The collector is shared across
+	// all requests, so without this any label set that disappears between
+	// scrapes (e.g. an ended Slurm job or a removed MIG instance) would
+	// linger as a stale time series.
 	c.usedMemory.Reset()
 	c.totalMemory.Reset()
 	c.dutyCycle.Reset()
@@ -354,7 +363,23 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	c.fanSpeed.Reset()
 	c.clock.Reset()
 	c.clockEventReason.Reset()
+	c.eccErrors.Reset()
 	c.lastError.Reset()
+	c.jobId.Reset()
+	c.jobUid.Reset()
+	c.graphicsUtil.Reset()
+	c.smUtil.Reset()
+	c.smOccupancy.Reset()
+	c.integerUtil.Reset()
+	c.anyTensorUtil.Reset()
+	c.dramBwUtil.Reset()
+	c.fp64Util.Reset()
+	c.fp32Util.Reset()
+	c.fp16Util.Reset()
+	c.pcieTxPerSec.Reset()
+	c.pcieRxPerSec.Reset()
+	c.nvlinkTotalRxPerSec.Reset()
+	c.nvlinkTotalTxPerSec.Reset()
 
 	numDevices, err := nvml.DeviceGetCount()
 	if err != nvml.SUCCESS {
@@ -391,7 +416,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 			continue
 		}
 
-		gpm, exists := gpmState[uuid]
+		gpm, exists := c.gpmState[uuid]
 		if !exists {
 			if *disableGpm {
 				gpm = GPM_DISABLED
@@ -407,12 +432,12 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 				log.Printf("GPU(%s) gpm = %d", uuid, gpm)
 			}
 			if gpm != GPM_DISABLED {
-				if allocGpmSamples(uuid) != nvml.SUCCESS {
+				if c.allocGpmSamples(uuid) != nvml.SUCCESS {
 					log.Printf("GPU(%s) disabling gpm due to GpmSample alloc errors", uuid)
 					gpm = GPM_DISABLED
 				}
 			}
-			gpmState[uuid] = gpm
+			c.gpmState[uuid] = gpm
 		}
 
 		name, err := dev.GetName()
@@ -447,7 +472,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 						log.Printf("UUID(minor=%d, mig=%d): error: %v", minorNumber, j, err)
 					}
 					// Check for GPM
-					gpmMig, exists := gpmState[migUuid]
+					gpmMig, exists := c.gpmState[migUuid]
 					if !exists {
 						if *disableGpm {
 							gpmMig = GPM_DISABLED
@@ -463,12 +488,12 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 							log.Printf("GPU(%s) gpm = %v", migUuid, gpmMig)
 						}
 						if gpmMig != GPM_DISABLED {
-							if allocGpmSamples(migUuid) != nvml.SUCCESS {
+							if c.allocGpmSamples(migUuid) != nvml.SUCCESS {
 								log.Printf("GPU(%s) disabling gpm due to GpmSample alloc errors", migUuid)
 								gpmMig = GPM_DISABLED
 							}
 						}
-						gpmState[migUuid] = gpmMig
+						c.gpmState[migUuid] = gpmMig
 					}
 					migName, err := migDev.GetName()
 					if err != nvml.SUCCESS {
@@ -640,15 +665,15 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 			}
 
 			// Collect gpm info
-			gpm = gpmState[oneDev.uuid]
+			gpm = c.gpmState[oneDev.uuid]
 			var sample1 nvml.GpmSample = nil
 			var sample2 nvml.GpmSample = nil
 			if gpm != GPM_DISABLED {
 				var ret error
 				if (gpm == GPM_NO_DATA) || (gpm == GPM_SAMPLE1_SAMPLE2) {
-					ret = oneDev.device.GpmSampleGet(gpmSamples1[oneDev.uuid])
+					ret = oneDev.device.GpmSampleGet(c.gpmSamples1[oneDev.uuid])
 				} else {
-					ret = oneDev.device.GpmSampleGet(gpmSamples2[oneDev.uuid])
+					ret = oneDev.device.GpmSampleGet(c.gpmSamples2[oneDev.uuid])
 				}
 				if ret != nvml.SUCCESS {
 					log.Printf("GPU(%s) error collecting gpm samples: %v", uuid, ret)
@@ -656,15 +681,15 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 				}
 				switch gpm {
 				case GPM_NO_DATA:
-					gpmState[oneDev.uuid] = GPM_SAMPLE1_ONLY
+					c.gpmState[oneDev.uuid] = GPM_SAMPLE1_ONLY
 				case GPM_SAMPLE1_ONLY, GPM_SAMPLE2_SAMPLE1:
-					gpmState[oneDev.uuid] = GPM_SAMPLE1_SAMPLE2
-					sample1 = gpmSamples1[oneDev.uuid]
-					sample2 = gpmSamples2[oneDev.uuid]
+					c.gpmState[oneDev.uuid] = GPM_SAMPLE1_SAMPLE2
+					sample1 = c.gpmSamples1[oneDev.uuid]
+					sample2 = c.gpmSamples2[oneDev.uuid]
 				case GPM_SAMPLE1_SAMPLE2:
-					gpmState[oneDev.uuid] = GPM_SAMPLE2_SAMPLE1
-					sample2 = gpmSamples1[oneDev.uuid]
-					sample1 = gpmSamples2[oneDev.uuid]
+					c.gpmState[oneDev.uuid] = GPM_SAMPLE2_SAMPLE1
+					sample2 = c.gpmSamples1[oneDev.uuid]
+					sample1 = c.gpmSamples2[oneDev.uuid]
 				}
 				if sample1 != nil && sample2 != nil {
 					gpmMetric := nvml.GpmMetricsGetType{
@@ -779,23 +804,6 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	c.nvlinkTotalTxPerSec.Collect(ch)
 }
 
-func metricsHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		registry := prometheus.NewRegistry()
-
-		registry.MustRegister(NewCollector())
-
-		gatherers := prometheus.Gatherers{registry}
-		if !*disableExporterMetrics {
-			gatherers = append(gatherers, prometheus.DefaultGatherer)
-		}
-
-		// Delegate http serving to Prometheus client library, which will call collector.Collect.
-		h := promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{})
-		h.ServeHTTP(w, r)
-	}
-}
-
 func main() {
 	flag.Parse()
 
@@ -810,9 +818,21 @@ func main() {
 		log.Printf("SystemGetDriverVersion(): %v", driverVersion)
 	}
 
-	metricsEndpoint := "/metrics"
-	http.Handle(metricsEndpoint, metricsHandler())
+	// Single collector shared across all scrape requests. The collector's
+	// mutex serializes all NVML calls, preventing concurrent ioctl access
+	// into the NVIDIA driver that caused rwsem deadlocks and null pointer
+	// dereferences when a new collector was instantiated per request.
+	collector := NewCollector()
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collector)
 
-	// Serve on all paths under addr
+	gatherers := prometheus.Gatherers{registry}
+	if !*disableExporterMetrics {
+		gatherers = append(gatherers, prometheus.DefaultGatherer)
+	}
+
+	h := promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{})
+	http.Handle("/metrics", h)
+
 	log.Fatalf("ListenAndServe error: %v", http.ListenAndServe(*addr, nil))
 }
